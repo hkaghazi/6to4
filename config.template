@@ -1,0 +1,90 @@
+# Configuration Template
+# Copy this file and fill in your values
+
+# ==============================================================================
+# SERVER A CONFIGURATION
+# ==============================================================================
+
+# Public IPv4 address (what you see on ifconfig/ip addr)
+SERVER_A_PUBLIC_IPV4="203.0.113.10"
+
+# IPv6 tunnel address (can use any private IPv6 range like fc00::/7)
+SERVER_A_IPV6_TUNNEL="fc00::1/64"
+
+# Inner IPv4 address (for application communication)
+SERVER_A_INNER_IPV4="10.0.0.1/30"
+
+# ==============================================================================
+# SERVER B CONFIGURATION
+# ==============================================================================
+
+# Public IPv4 address
+SERVER_B_PUBLIC_IPV4="203.0.113.20"
+
+# IPv6 tunnel address
+SERVER_B_IPV6_TUNNEL="fc00::2/64"
+
+# Inner IPv4 address
+SERVER_B_INNER_IPV4="10.0.0.2/30"
+
+# ==============================================================================
+# TUNNEL CONFIGURATION
+# ==============================================================================
+
+# MTU for 6to4 tunnel (typical: 1280-1480)
+# Start with 1400, reduce if you experience packet loss
+TUNNEL_MTU="1400"
+
+# Interface names (optional, defaults are fine)
+INTERFACE_6TO4="sit6to4"
+INTERFACE_IPIPV6="ipip6"
+
+# ==============================================================================
+# USAGE COMMANDS
+# ==============================================================================
+
+# On Server A:
+# sudo ./setup-6to4-tunnel.sh --setup-full \
+#   --local-ipv4-public $SERVER_A_PUBLIC_IPV4 \
+#   --remote-ipv4-public $SERVER_B_PUBLIC_IPV4 \
+#   --local-ipv6-tunnel $SERVER_A_IPV6_TUNNEL \
+#   --remote-ipv6-tunnel ${SERVER_B_IPV6_TUNNEL%/*} \
+#   --local-ipv4-inner $SERVER_A_INNER_IPV4 \
+#   --remote-ipv4-inner ${SERVER_B_INNER_IPV4%/*} \
+#   --mtu $TUNNEL_MTU
+
+# On Server B:
+# sudo ./setup-6to4-tunnel.sh --setup-full \
+#   --local-ipv4-public $SERVER_B_PUBLIC_IPV4 \
+#   --remote-ipv4-public $SERVER_A_PUBLIC_IPV4 \
+#   --local-ipv6-tunnel $SERVER_B_IPV6_TUNNEL \
+#   --remote-ipv6-tunnel ${SERVER_A_IPV6_TUNNEL%/*} \
+#   --local-ipv4-inner $SERVER_B_INNER_IPV4 \
+#   --remote-ipv4-inner ${SERVER_A_INNER_IPV4%/*} \
+#   --mtu $TUNNEL_MTU
+
+# ==============================================================================
+# NOTES
+# ==============================================================================
+
+# 1. Get your public IP:
+#    curl ifconfig.me
+#    or
+#    hostname -I | awk '{print $1}'
+
+# 2. IPv6 tunnel addresses should be in the same subnet:
+#    fc00::1/64 and fc00::2 are in the same /64 subnet
+#    fd00:1234::1/64 and fd00:1234::2 work too
+
+# 3. Inner IPv4 should be a point-to-point network:
+#    /30 gives you 2 usable IPs (perfect for two servers)
+#    /24 gives you 254 usable IPs (if you need more hosts)
+
+# 4. Make sure protocol 41 (6to4) is not blocked by firewall:
+#    sudo iptables -A INPUT -p 41 -j ACCEPT
+#    sudo iptables -A OUTPUT -p 41 -j ACCEPT
+
+# 5. Test connectivity at each layer:
+#    Layer 1: ping $SERVER_B_PUBLIC_IPV4        # Test basic connectivity
+#    Layer 2: ping6 ${SERVER_B_IPV6_TUNNEL%/*}  # Test 6to4 tunnel
+#    Layer 3: ping ${SERVER_B_INNER_IPV4%/*}    # Test full stack
