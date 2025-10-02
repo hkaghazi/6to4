@@ -42,6 +42,8 @@ VPN_SUBNET=""           # VPN subnet for client devices (e.g., 10.8.0.0/24)
 NAT_INTERFACE=""        # Interface for NAT/masquerading (server mode)
 WHITELIST_FILE="/etc/6to4/whitelist.txt"  # File containing whitelist IPs/ranges
 WHITELIST_ACTION=""      # Action: add, import, remove, clear, list
+TARGET_HOST=""           # Target host for MTU testing
+NEW_MTU=""               # New MTU value for manual setting
 
 ################################################################################
 # Helper Functions
@@ -79,6 +81,9 @@ MODES:
     --test                  Test connectivity between servers
     --cleanup               Remove tunnel configuration
     --status                Show tunnel status
+    --diagnose-mtu          Run MTU diagnostics and suggest optimal values
+    --optimize-mtu          Automatically optimize MTU for best performance
+    --set-mtu <size>        Manually set MTU for tunnel interfaces
     --whitelist-add <ip>    Add IP/CIDR to whitelist (bypass VPN)
     --whitelist-import <file> Import IPs from file (one IP/CIDR per line)
     --whitelist-remove <ip> Remove IP/CIDR from whitelist
@@ -121,6 +126,12 @@ WHITELIST OPTIONS:
     --whitelist-clear           Remove all whitelist entries
     --whitelist-list            Display all whitelisted IPs
     --whitelist-file <path>     Custom path for whitelist file
+
+MTU OPTIMIZATION OPTIONS:
+    --diagnose-mtu              Run comprehensive MTU diagnostics
+    --optimize-mtu              Automatically find and set optimal MTU
+    --set-mtu <size>            Manually set MTU (affects both tunnels)
+    --target-host <host>        Target host for MTU testing (default: 8.8.8.8)
     
 VPN SERVER MODE (--setup-vpn-server):
     Sets up full tunnel stack + NAT/masquerading for client traffic
@@ -628,6 +639,257 @@ clear_whitelist_routing() {
     done < "$WHITELIST_FILE"
     
     print_info "Removed $count whitelist routing rules"
+}
+
+################################################################################
+# MTU Optimization Functions
+################################################################################
+
+diagnose_mtu() {
+    print_info "Running MTU diagnostics..."
+    echo ""
+    
+    # Check if tunnel exists
+    if ! ip link show "$IPIPV6_INTERFACE" >/dev/null 2>&1; then
+        print_error "IPIPv6 tunnel interface '$IPIPV6_INTERFACE' not found"
+        print_info "Please setup VPN client first with --setup-vpn-client"
+        exit 1
+    fi
+    
+    echo -e "${BLUE}=== Current MTU Configuration ===${NC}"
+    echo ""
+    
+    # Show current MTU values
+    local sit_mtu=$(ip link show "$INTERFACE_NAME" 2>/dev/null | grep -oP 'mtu \K[0-9]+' || echo "not found")
+    local ipip6_mtu=$(ip link show "$IPIPV6_INTERFACE" 2>/dev/null | grep -oP 'mtu \K[0-9]+' || echo "not found")
+    
+    print_info "6to4 (SIT) interface MTU: $sit_mtu bytes"
+    print_info "IPIPv6 interface MTU: $ipip6_mtu bytes"
+    echo ""
+    
+    echo -e "${BLUE}=== MTU Theory for Nested Tunnels ===${NC}"
+    echo ""
+    print_info "Architecture: App → IPIPv6 → 6to4 → Physical Network"
+    print_info "Overhead breakdown:"
+    echo "  - Physical network MTU: 1500 bytes (typical)"
+    echo "  - IPv4 header: 20 bytes"
+    echo "  - IPv6 header (6to4): 40 bytes"
+    echo "  - IPv4 header (IPIPv6): 20 bytes"
+    echo "  - Total overhead: 80 bytes"
+    echo "  - Recommended IPIPv6 MTU: 1420 bytes (1500 - 80)"
+    echo "  - Recommended 6to4 MTU: 1440 bytes (1500 - 60)"
+    echo ""
+    
+    # Test target
+    local target="${TARGET_HOST:-8.8.8.8}"
+    
+    echo -e "${BLUE}=== MTU Path Discovery Test (to $target) ===${NC}"
+    echo ""
+    
+    print_info "Testing various packet sizes (DF=Don't Fragment)..."
+    echo ""
+    
+    # Test different MTU sizes
+    local test_sizes=(1400 1350 1300 1250 1200 1150 1100 1050 1000)
+    local working_mtu=0
+    
+    for size in "${test_sizes[@]}"; do
+        # Subtract 28 bytes for ICMP + IP headers
+        local data_size=$((size - 28))
+        
+        if ping -c 1 -M do -s $data_size -W 2 "$target" >/dev/null 2>&1; then
+            print_success "MTU $size: ✓ Working"
+            working_mtu=$size
+            break
+        else
+            print_warning "MTU $size: ✗ Fragmentation or packet loss"
+        fi
+    done
+    
+    echo ""
+    
+    if [ $working_mtu -gt 0 ]; then
+        echo -e "${GREEN}=== Diagnosis Results ===${NC}"
+        echo ""
+        print_success "Maximum working MTU: $working_mtu bytes"
+        
+        # Calculate optimal values
+        local optimal_ipip6_mtu=$((working_mtu - 20))
+        local optimal_6to4_mtu=$((working_mtu + 20))
+        
+        echo ""
+        echo -e "${YELLOW}Recommended MTU values:${NC}"
+        echo "  6to4 interface ($INTERFACE_NAME): $optimal_6to4_mtu bytes"
+        echo "  IPIPv6 interface ($IPIPV6_INTERFACE): $optimal_ipip6_mtu bytes"
+        echo ""
+        
+        if [ "$ipip6_mtu" != "$optimal_ipip6_mtu" ]; then
+            print_warning "Current IPIPv6 MTU ($ipip6_mtu) is NOT optimal!"
+            echo ""
+            echo -e "${YELLOW}To fix slow wget/download speeds:${NC}"
+            echo "  $0 --set-mtu $optimal_6to4_mtu"
+            echo ""
+            echo "Or use automatic optimization:"
+            echo "  $0 --optimize-mtu"
+        else
+            print_success "MTU is already optimized!"
+        fi
+    else
+        print_error "Could not find working MTU. Network issues detected."
+        print_info "Try testing connectivity first: ping $target"
+    fi
+    
+    echo ""
+    echo -e "${BLUE}=== TCP MSS Clamping ===${NC}"
+    echo ""
+    print_info "Checking if MSS clamping is configured..."
+    
+    if iptables -t mangle -L FORWARD -n 2>/dev/null | grep -q "TCPMSS"; then
+        print_success "MSS clamping is active"
+        iptables -t mangle -L FORWARD -n -v | grep TCPMSS
+    else
+        print_warning "MSS clamping is NOT configured"
+        print_info "MSS clamping can improve TCP performance over VPN"
+        echo ""
+        echo "To enable MSS clamping:"
+        echo "  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+    fi
+}
+
+optimize_mtu() {
+    print_info "Running automatic MTU optimization..."
+    echo ""
+    
+    # Check if tunnel exists
+    if ! ip link show "$IPIPV6_INTERFACE" >/dev/null 2>&1; then
+        print_error "IPIPv6 tunnel interface '$IPIPV6_INTERFACE' not found"
+        print_info "Please setup VPN client first with --setup-vpn-client"
+        exit 1
+    fi
+    
+    # Test target
+    local target="${TARGET_HOST:-8.8.8.8}"
+    
+    print_info "Finding optimal MTU by testing to $target..."
+    echo ""
+    
+    # Binary search for optimal MTU
+    local min_mtu=1000
+    local max_mtu=1500
+    local optimal_mtu=0
+    
+    while [ $((max_mtu - min_mtu)) -gt 10 ]; do
+        local test_mtu=$(((min_mtu + max_mtu) / 2))
+        local data_size=$((test_mtu - 28))
+        
+        print_info "Testing MTU $test_mtu..."
+        
+        if ping -c 2 -M do -s $data_size -W 2 "$target" >/dev/null 2>&1; then
+            print_success "MTU $test_mtu: Working ✓"
+            min_mtu=$test_mtu
+            optimal_mtu=$test_mtu
+        else
+            print_warning "MTU $test_mtu: Too large ✗"
+            max_mtu=$((test_mtu - 1))
+        fi
+    done
+    
+    if [ $optimal_mtu -eq 0 ]; then
+        optimal_mtu=$min_mtu
+    fi
+    
+    echo ""
+    print_success "Optimal working MTU found: $optimal_mtu bytes"
+    echo ""
+    
+    # Calculate tunnel MTU values
+    local new_6to4_mtu=$((optimal_mtu + 20))
+    local new_ipip6_mtu=$((optimal_mtu - 20))
+    
+    print_info "Applying optimal MTU values..."
+    echo "  6to4 MTU: $new_6to4_mtu bytes"
+    echo "  IPIPv6 MTU: $new_ipip6_mtu bytes"
+    echo ""
+    
+    # Apply MTU changes
+    set_mtu_internal "$new_6to4_mtu"
+    
+    echo ""
+    print_success "MTU optimization complete!"
+    echo ""
+    echo -e "${YELLOW}Test the improvement:${NC}"
+    echo "  wget -O /dev/null http://speedtest.tele2.net/10MB.zip"
+    echo "  curl -o /dev/null http://speedtest.tele2.net/10MB.zip"
+}
+
+set_mtu_internal() {
+    local new_6to4_mtu="$1"
+    local new_ipip6_mtu=$((new_6to4_mtu - 40))
+    
+    # Set 6to4 MTU
+    if ip link show "$INTERFACE_NAME" >/dev/null 2>&1; then
+        ip link set "$INTERFACE_NAME" mtu "$new_6to4_mtu"
+        print_success "Set $INTERFACE_NAME MTU to $new_6to4_mtu bytes"
+    else
+        print_warning "6to4 interface $INTERFACE_NAME not found"
+    fi
+    
+    # Set IPIPv6 MTU
+    if ip link show "$IPIPV6_INTERFACE" >/dev/null 2>&1; then
+        ip link set "$IPIPV6_INTERFACE" mtu "$new_ipip6_mtu"
+        print_success "Set $IPIPV6_INTERFACE MTU to $new_ipip6_mtu bytes"
+    else
+        print_warning "IPIPv6 interface $IPIPV6_INTERFACE not found"
+    fi
+    
+    # Enable MSS clamping for better TCP performance
+    print_info "Configuring TCP MSS clamping..."
+    
+    # Remove old rules if they exist
+    iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    
+    # Add MSS clamping rule
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    print_success "MSS clamping enabled"
+    
+    # Save iptables
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save 2>/dev/null || true
+    fi
+}
+
+set_mtu_manual() {
+    local new_6to4_mtu="$1"
+    
+    if [ -z "$new_6to4_mtu" ]; then
+        print_error "MTU size not specified"
+        print_info "Usage: $0 --set-mtu <size>"
+        print_info "Example: $0 --set-mtu 1400"
+        exit 1
+    fi
+    
+    # Validate MTU
+    if ! [[ "$new_6to4_mtu" =~ ^[0-9]+$ ]] || [ "$new_6to4_mtu" -lt 576 ] || [ "$new_6to4_mtu" -gt 1500 ]; then
+        print_error "Invalid MTU: $new_6to4_mtu"
+        print_info "MTU must be between 576 and 1500 bytes"
+        exit 1
+    fi
+    
+    print_info "Setting MTU to $new_6to4_mtu bytes..."
+    echo ""
+    
+    set_mtu_internal "$new_6to4_mtu"
+    
+    echo ""
+    print_success "MTU updated successfully!"
+    echo ""
+    print_info "Current configuration:"
+    echo "  6to4 MTU: $new_6to4_mtu bytes"
+    echo "  IPIPv6 MTU: $((new_6to4_mtu - 40)) bytes"
+    echo ""
+    echo -e "${YELLOW}Test the change:${NC}"
+    echo "  ping -c 4 8.8.8.8"
+    echo "  wget -O /dev/null http://speedtest.tele2.net/10MB.zip"
 }
 
 ################################################################################
@@ -1379,6 +1641,21 @@ while [ $# -gt 0 ]; do
             WHITELIST_FILE="$2"
             shift
             ;;
+        --diagnose-mtu)
+            MODE="diagnose-mtu"
+            ;;
+        --optimize-mtu)
+            MODE="optimize-mtu"
+            ;;
+        --set-mtu)
+            MODE="set-mtu"
+            NEW_MTU="$2"
+            shift
+            ;;
+        --target-host)
+            TARGET_HOST="$2"
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -1442,6 +1719,17 @@ case "$MODE" in
         ;;
     whitelist-list)
         whitelist_list
+        ;;
+    diagnose-mtu)
+        diagnose_mtu
+        ;;
+    optimize-mtu)
+        check_root
+        optimize_mtu
+        ;;
+    set-mtu)
+        check_root
+        set_mtu_manual "$NEW_MTU"
         ;;
     *)
         print_error "No valid mode specified"
