@@ -24,6 +24,7 @@ NC='\033[0m' # No Color
 
 # Default values
 MODE=""
+VPN_MODE=""             # "server" or "client" for VPN functionality
 LOCAL_IPV4_PUBLIC=""    # Public IPv4 address for 6to4 tunnel endpoint
 REMOTE_IPV4_PUBLIC=""   # Remote public IPv4 address for 6to4 tunnel
 LOCAL_IPV6_TUNNEL=""    # IPv6 address on 6to4 tunnel
@@ -37,6 +38,8 @@ DEFAULT_6TO4_MTU=1280
 IPV6_INTERFACE=""
 TEST_MODE=false
 CLEANUP=false
+VPN_SUBNET=""           # VPN subnet for client devices (e.g., 10.8.0.0/24)
+NAT_INTERFACE=""        # Interface for NAT/masquerading (server mode)
 
 ################################################################################
 # Helper Functions
@@ -69,6 +72,8 @@ MODES:
     --setup-full            Setup complete stack (6to4 + IPIPv6)
     --setup-6to4            Setup 6to4 tunnel only (IPv6 over IPv4)
     --setup-ipipv6          Setup IPIPv6 tunnel only (IPv4 over IPv6)
+    --setup-vpn-server      Setup VPN server with NAT/masquerading
+    --setup-vpn-client      Setup VPN client with routing
     --test                  Test connectivity between servers
     --cleanup               Remove tunnel configuration
     --status                Show tunnel status
@@ -97,6 +102,20 @@ IPIPV6 TUNNEL OPTIONS (--setup-ipipv6):
     --remote-ipv6-tunnel <ip>   Remote IPv6 address (from 6to4 tunnel)
     --ipipv6-interface <name>   Name for IPIPv6 interface (default: ipip6)
 
+VPN OPTIONS:
+    --vpn-subnet <subnet>       VPN subnet for client traffic (e.g., 10.8.0.0/24)
+    --nat-interface <iface>     Network interface for NAT (server mode, e.g., eth0)
+    
+VPN SERVER MODE (--setup-vpn-server):
+    Sets up full tunnel stack + NAT/masquerading for client traffic
+    Requires all full stack options plus:
+    --nat-interface <iface>     Interface connected to internet (for masquerading)
+    
+VPN CLIENT MODE (--setup-vpn-client):
+    Sets up full tunnel stack + routes all traffic through VPN
+    Requires all full stack options plus:
+    --vpn-subnet <subnet>       Optional: specific subnet to route (default: 0.0.0.0/0)
+
 TEST OPTIONS:
     --ping-test                 Run ping connectivity tests
     --target-ipv4-inner <ip>    Target inner IPv4 address for testing
@@ -104,7 +123,28 @@ TEST OPTIONS:
     --traceroute                Run traceroute tests
 
 EXAMPLES:
-    # Complete setup on Server 1 (connects to Server 2 via IPv4)
+    # VPN Server setup (masquerades all client traffic)
+    $0 --setup-vpn-server \\
+       --local-ipv4-public 203.0.113.10 \\
+       --remote-ipv4-public 203.0.113.20 \\
+       --local-ipv6-tunnel fc00::1/64 \\
+       --remote-ipv6-tunnel fc00::2 \\
+       --local-ipv4-inner 10.0.0.1/30 \\
+       --remote-ipv4-inner 10.0.0.2 \\
+       --nat-interface eth0 \\
+       --mtu 1400
+
+    # VPN Client setup (routes all traffic through tunnel)
+    $0 --setup-vpn-client \\
+       --local-ipv4-public 203.0.113.20 \\
+       --remote-ipv4-public 203.0.113.10 \\
+       --local-ipv6-tunnel fc00::2/64 \\
+       --remote-ipv6-tunnel fc00::1 \\
+       --local-ipv4-inner 10.0.0.2/30 \\
+       --remote-ipv4-inner 10.0.0.1 \\
+       --mtu 1400
+
+    # Basic tunnel setup (no VPN routing)
     $0 --setup-full \\
        --local-ipv4-public 203.0.113.10 \\
        --remote-ipv4-public 203.0.113.20 \\
@@ -112,16 +152,6 @@ EXAMPLES:
        --remote-ipv6-tunnel fc00::2 \\
        --local-ipv4-inner 10.0.0.1/30 \\
        --remote-ipv4-inner 10.0.0.2 \\
-       --mtu 1400
-
-    # Complete setup on Server 2
-    $0 --setup-full \\
-       --local-ipv4-public 203.0.113.20 \\
-       --remote-ipv4-public 203.0.113.10 \\
-       --local-ipv6-tunnel fc00::2/64 \\
-       --remote-ipv6-tunnel fc00::1 \\
-       --local-ipv4-inner 10.0.0.2/30 \\
-       --remote-ipv4-inner 10.0.0.1 \\
        --mtu 1400
 
     # Test inner IPv4 connectivity
@@ -317,12 +347,173 @@ setup_ipipv6_tunnel() {
 }
 
 ################################################################################
+# VPN Functions
+################################################################################
+
+setup_vpn_server() {
+    print_info "Setting up VPN server mode (with NAT/masquerading)..."
+    echo ""
+    
+    # Validate NAT interface
+    if [ -z "$NAT_INTERFACE" ]; then
+        print_error "NAT interface required for VPN server mode"
+        print_error "Use: --nat-interface <interface> (e.g., eth0, ens3)"
+        exit 1
+    fi
+    
+    if ! ip link show "$NAT_INTERFACE" >/dev/null 2>&1; then
+        print_error "NAT interface $NAT_INTERFACE does not exist"
+        print_info "Available interfaces:"
+        ip link show | grep -E "^[0-9]+:" | awk '{print "  " $2}' | tr -d ':'
+        exit 1
+    fi
+    
+    # Setup full stack first
+    VPN_MODE="server"
+    setup_full_stack
+    
+    echo ""
+    echo -e "${BLUE}=== Step 3: Configure VPN Server (NAT/Masquerading) ===${NC}"
+    
+    # Enable IP masquerading/NAT
+    print_info "Enabling IP masquerading on $NAT_INTERFACE"
+    
+    # Check if iptables is available
+    if ! command -v iptables >/dev/null 2>&1; then
+        print_error "iptables not found. Install with: apt-get install iptables"
+        exit 1
+    fi
+    
+    # Add NAT rule for traffic coming from IPIPv6 tunnel
+    print_info "Adding MASQUERADE rule for tunnel traffic"
+    iptables -t nat -C POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE
+    
+    # Allow forwarding from IPIPv6 interface
+    print_info "Configuring firewall rules for VPN traffic"
+    iptables -C FORWARD -i "$IPIPV6_INTERFACE" -o "$NAT_INTERFACE" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$IPIPV6_INTERFACE" -o "$NAT_INTERFACE" -j ACCEPT
+    
+    iptables -C FORWARD -i "$NAT_INTERFACE" -o "$IPIPV6_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$NAT_INTERFACE" -o "$IPIPV6_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    
+    # Save iptables rules (Ubuntu/Debian)
+    print_info "Saving iptables rules..."
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save 2>/dev/null || true
+    elif command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
+        iptables-save > /etc/iptables.rules 2>/dev/null || \
+        print_warning "Could not save iptables rules automatically"
+    fi
+    
+    print_success "VPN Server setup complete!"
+    echo ""
+    echo -e "${GREEN}VPN Server Configuration:${NC}"
+    echo "  NAT Interface: $NAT_INTERFACE"
+    echo "  Tunnel Interface: $IPIPV6_INTERFACE"
+    echo "  Inner IPv4: $LOCAL_IPV4_INNER"
+    echo "  Client traffic will be masqueraded through $NAT_INTERFACE"
+    echo ""
+    echo -e "${YELLOW}Firewall rules:${NC}"
+    echo "  - Masquerading enabled on $NAT_INTERFACE"
+    echo "  - Forwarding allowed from $IPIPV6_INTERFACE to $NAT_INTERFACE"
+    echo ""
+}
+
+setup_vpn_client() {
+    print_info "Setting up VPN client mode (route all traffic through tunnel)..."
+    echo ""
+    
+    # Setup full stack first
+    VPN_MODE="client"
+    setup_full_stack
+    
+    echo ""
+    echo -e "${BLUE}=== Step 3: Configure VPN Client Routing ===${NC}"
+    
+    # Store original default gateway
+    print_info "Detecting current default gateway..."
+    ORIGINAL_GW=$(ip route show default | awk '/default/ {print $3; exit}')
+    ORIGINAL_IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
+    
+    if [ -z "$ORIGINAL_GW" ]; then
+        print_error "Could not detect original default gateway"
+        exit 1
+    fi
+    
+    print_info "Original gateway: $ORIGINAL_GW via $ORIGINAL_IFACE"
+    
+    # Add route to remote public IP via original gateway (to maintain tunnel connectivity)
+    print_info "Adding route to remote server via original gateway"
+    ip route add "$REMOTE_IPV4_PUBLIC"/32 via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" 2>/dev/null || \
+        print_warning "Route to $REMOTE_IPV4_PUBLIC already exists"
+    
+    # Determine what to route through VPN
+    if [ -z "$VPN_SUBNET" ] || [ "$VPN_SUBNET" = "0.0.0.0/0" ]; then
+        print_info "Routing ALL traffic through VPN tunnel"
+        
+        # Delete existing default route
+        print_info "Removing original default route"
+        ip route del default via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" 2>/dev/null || true
+        
+        # Add default route through VPN (split into two /1 routes to override default)
+        print_info "Adding new default route through VPN"
+        ip route add 0.0.0.0/1 via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" 2>/dev/null || true
+        ip route add 128.0.0.0/1 via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" 2>/dev/null || true
+    else
+        print_info "Routing specific subnet through VPN: $VPN_SUBNET"
+        ip route add "$VPN_SUBNET" via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" 2>/dev/null || \
+            print_warning "Route for $VPN_SUBNET already exists"
+    fi
+    
+    # Configure DNS (optional - point to common DNS servers)
+    print_info "Configuring DNS for VPN..."
+    if [ -f /etc/resolv.conf.backup ]; then
+        print_warning "DNS backup already exists at /etc/resolv.conf.backup"
+    else
+        cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
+        cat > /etc/resolv.conf << 'DNSEOF'
+# VPN DNS configuration
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+DNSEOF
+        print_info "DNS configured (backup saved to /etc/resolv.conf.backup)"
+    fi
+    
+    print_success "VPN Client setup complete!"
+    echo ""
+    echo -e "${GREEN}VPN Client Configuration:${NC}"
+    echo "  Tunnel Interface: $IPIPV6_INTERFACE"
+    echo "  Inner IPv4: $LOCAL_IPV4_INNER"
+    echo "  Remote Gateway: ${REMOTE_IPV4_INNER%%/*}"
+    echo "  Original Gateway: $ORIGINAL_GW (preserved for tunnel traffic)"
+    if [ -z "$VPN_SUBNET" ] || [ "$VPN_SUBNET" = "0.0.0.0/0" ]; then
+        echo "  Routing: ALL traffic through VPN"
+    else
+        echo "  Routing: $VPN_SUBNET through VPN"
+    fi
+    echo ""
+    echo -e "${YELLOW}Test VPN connectivity:${NC}"
+    echo "  curl ifconfig.me  # Should show VPN server's public IP"
+    echo "  ping 8.8.8.8      # Test internet connectivity"
+    echo ""
+    echo -e "${YELLOW}To restore original routing:${NC}"
+    echo "  $0 --cleanup"
+    echo ""
+}
+
+################################################################################
 # Full Stack Setup (6to4 + IPIPv6)
 ################################################################################
 
 setup_full_stack() {
-    print_info "Setting up full tunnel stack (IPv4 → IPIPv6 → 6to4 → IPv4)"
-    echo ""
+    # Skip header if called from VPN setup
+    if [ -z "$VPN_MODE" ]; then
+        print_info "Setting up full tunnel stack (IPv4 → IPIPv6 → 6to4 → IPv4)"
+        echo ""
+    fi
     
     # Validate all required parameters
     if [ -z "$LOCAL_IPV4_PUBLIC" ] || [ -z "$REMOTE_IPV4_PUBLIC" ] || \
@@ -345,17 +536,20 @@ setup_full_stack() {
     setup_ipipv6_tunnel
     echo ""
     
-    print_success "Full tunnel stack setup complete!"
-    echo ""
-    echo -e "${GREEN}Architecture:${NC}"
-    echo "  Layer 1 (Physical): IPv4 network"
-    echo "  Layer 2 (6to4):     $LOCAL_IPV4_PUBLIC ←→ $REMOTE_IPV4_PUBLIC"
-    echo "  Layer 3 (IPv6):     ${LOCAL_IPV6_TUNNEL%%/*} ←→ ${REMOTE_IPV6_TUNNEL%%/*}"
-    echo "  Layer 4 (IPIPv6):   $LOCAL_IPV4_INNER ←→ ${REMOTE_IPV4_INNER%%/*}"
-    echo ""
-    echo -e "${YELLOW}Test connectivity with:${NC}"
-    echo "  ping ${REMOTE_IPV4_INNER%%/*}"
-    echo "  $0 --test --target-ipv4-inner ${REMOTE_IPV4_INNER%%/*}"
+    # Only show summary if not in VPN mode (VPN functions will show their own summary)
+    if [ -z "$VPN_MODE" ]; then
+        print_success "Full tunnel stack setup complete!"
+        echo ""
+        echo -e "${GREEN}Architecture:${NC}"
+        echo "  Layer 1 (Physical): IPv4 network"
+        echo "  Layer 2 (6to4):     $LOCAL_IPV4_PUBLIC ←→ $REMOTE_IPV4_PUBLIC"
+        echo "  Layer 3 (IPv6):     ${LOCAL_IPV6_TUNNEL%%/*} ←→ ${REMOTE_IPV6_TUNNEL%%/*}"
+        echo "  Layer 4 (IPIPv6):   $LOCAL_IPV4_INNER ←→ ${REMOTE_IPV4_INNER%%/*}"
+        echo ""
+        echo -e "${YELLOW}Test connectivity with:${NC}"
+        echo "  ping ${REMOTE_IPV4_INNER%%/*}"
+        echo "  $0 --test --target-ipv4-inner ${REMOTE_IPV4_INNER%%/*}"
+    fi
 }
 
 ################################################################################
@@ -512,26 +706,93 @@ show_status() {
 
 cleanup_tunnels() {
     print_info "Cleaning up tunnel configurations..."
+    echo ""
     
-    # Remove 6to4 interfaces
-    for iface in $(ip link show type sit 2>/dev/null | grep -oP '^\d+: \K[^:]+' || true); do
-        if [ "$iface" != "sit0" ]; then
-            print_info "Removing sit interface: $iface"
+    # Restore DNS if backup exists
+    if [ -f /etc/resolv.conf.backup ]; then
+        print_info "Restoring original DNS configuration..."
+        mv /etc/resolv.conf.backup /etc/resolv.conf
+        print_success "DNS configuration restored"
+    fi
+    
+    # Remove VPN routes first
+    print_info "Removing VPN routes..."
+    ip route del 0.0.0.0/1 2>/dev/null || true
+    ip route del 128.0.0.0/1 2>/dev/null || true
+    
+    # Get all tunnel interfaces before deletion
+    print_info "Finding tunnel interfaces..."
+    SIT_INTERFACES=$(ip link show 2>/dev/null | grep -E "^[0-9]+: (sit|6to4|tun6to4)" | awk '{print $2}' | tr -d ':' || true)
+    IP6TNL_INTERFACES=$(ip link show 2>/dev/null | grep -E "^[0-9]+: (ip6tnl|ipip6)" | awk '{print $2}' | tr -d ':' || true)
+    
+    # Remove iptables rules
+    print_info "Removing iptables rules..."
+    if command -v iptables >/dev/null 2>&1; then
+        # List and remove MASQUERADE rules
+        iptables -t nat -S POSTROUTING 2>/dev/null | grep MASQUERADE | while read -r line; do
+            rule=$(echo "$line" | sed 's/^-A/-D/')
+            iptables -t nat $rule 2>/dev/null || true
+        done
+        
+        # Remove FORWARD rules for tunnel interfaces
+        for iface in $IP6TNL_INTERFACES; do
+            iptables -D FORWARD -i "$iface" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -o "$iface" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$iface" -o "*" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        done
+        
+        print_success "Iptables rules removed"
+    fi
+    
+    # Remove IPIPv6 interfaces (ip6tnl type)
+    if [ -n "$IP6TNL_INTERFACES" ]; then
+        for iface in $IP6TNL_INTERFACES; do
+            if [ "$iface" != "ip6tnl0" ] && [ -n "$iface" ]; then
+                print_info "Removing IPIPv6 interface: $iface"
+                ip link set "$iface" down 2>/dev/null || true
+                ip -6 tunnel del "$iface" 2>/dev/null || true
+            fi
+        done
+    else
+        print_info "No IPIPv6 interfaces found"
+    fi
+    
+    # Remove 6to4/SIT interfaces
+    if [ -n "$SIT_INTERFACES" ]; then
+        for iface in $SIT_INTERFACES; do
+            if [ "$iface" != "sit0" ] && [ -n "$iface" ]; then
+                print_info "Removing SIT interface: $iface"
+                ip link set "$iface" down 2>/dev/null || true
+                ip tunnel del "$iface" 2>/dev/null || true
+            fi
+        done
+    else
+        print_info "No SIT interfaces found"
+    fi
+    
+    # Clean up any remaining tunnel interfaces by name patterns
+    print_info "Checking for remaining tunnel interfaces..."
+    for iface in sit6to4 6to4 tun6to4 ipip6 ipipv6; do
+        if ip link show "$iface" >/dev/null 2>&1; then
+            print_info "Removing interface: $iface"
             ip link set "$iface" down 2>/dev/null || true
             ip tunnel del "$iface" 2>/dev/null || true
-        fi
-    done
-    
-    # Remove IPIPv6 interfaces
-    for iface in $(ip link show type ip6tnl 2>/dev/null | grep -oP '^\d+: \K[^:]+' || true); do
-        if [ "$iface" != "ip6tnl0" ]; then
-            print_info "Removing ip6tnl interface: $iface"
-            ip link set "$iface" down 2>/dev/null || true
             ip -6 tunnel del "$iface" 2>/dev/null || true
         fi
     done
     
+    # Save iptables if persistence is available
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        print_info "Saving iptables configuration..."
+        netfilter-persistent save 2>/dev/null || true
+    fi
+    
+    echo ""
     print_success "Cleanup complete!"
+    print_info "All tunnel interfaces and routes have been removed"
+    print_info "Original network configuration should be restored"
+    echo ""
 }
 
 ################################################################################
@@ -553,6 +814,12 @@ while [ $# -gt 0 ]; do
             ;;
         --setup-ipipv6)
             MODE="setup-ipipv6"
+            ;;
+        --setup-vpn-server)
+            MODE="vpn-server"
+            ;;
+        --setup-vpn-client)
+            MODE="vpn-client"
             ;;
         --test)
             MODE="test"
@@ -601,6 +868,14 @@ while [ $# -gt 0 ]; do
             MTU="$2"
             shift
             ;;
+        --vpn-subnet)
+            VPN_SUBNET="$2"
+            shift
+            ;;
+        --nat-interface)
+            NAT_INTERFACE="$2"
+            shift
+            ;;
         --target-ipv6-tunnel)
             TARGET_IPV6_TUNNEL="$2"
             shift
@@ -641,6 +916,14 @@ case "$MODE" in
     setup-ipipv6)
         check_root
         setup_ipipv6_tunnel
+        ;;
+    vpn-server)
+        check_root
+        setup_vpn_server
+        ;;
+    vpn-client)
+        check_root
+        setup_vpn_client
         ;;
     test)
         test_connectivity

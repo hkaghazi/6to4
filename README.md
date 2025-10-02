@@ -19,13 +19,16 @@ This allows you to:
 
 ## Features
 
+- **VPN Mode**: NEW! Route all traffic through a VPN server with NAT/masquerading
+  - **Server Mode**: Accept client connections and provide internet access
+  - **Client Mode**: Route all device traffic through the VPN tunnel
 - **Full Stack Setup**: One-command setup of both 6to4 and IPIPv6 tunnels
 - **6to4 Tunnel**: IPv6 connectivity over IPv4 network (SIT protocol)
 - **IPIPv6 Tunnel**: IPv4 encapsulation over the IPv6 tunnel
 - **MTU Configuration**: Automatic MTU calculation with configurable options
 - **Connectivity Testing**: Built-in ping, traceroute, and MTU path discovery
 - **Status Monitoring**: View tunnel configurations and routing tables
-- **Easy Cleanup**: Remove all tunnel configurations with one command
+- **Easy Cleanup**: Remove all tunnel configurations with one command (now fixed!)
 
 ## Requirements
 
@@ -150,6 +153,55 @@ sudo ./setup-6to4-tunnel.sh --setup-ipipv6 \
   --remote-ipv6-tunnel fc00::2
 ```
 
+## 🆕 VPN Mode (NEW!)
+
+Route all traffic through a VPN server using the tunnel infrastructure:
+
+### VPN Server Setup
+
+```bash
+# On your VPN server (with internet access)
+sudo ./setup-6to4-tunnel.sh --setup-vpn-server \
+  --local-ipv4-public 203.0.113.10 \
+  --remote-ipv4-public 203.0.113.20 \
+  --local-ipv6-tunnel fc00::1/64 \
+  --remote-ipv6-tunnel fc00::2 \
+  --local-ipv4-inner 10.0.0.1/30 \
+  --remote-ipv4-inner 10.0.0.2 \
+  --nat-interface eth0 \
+  --mtu 1400
+```
+
+### VPN Client Setup
+
+```bash
+# On your client machine (routes ALL traffic through VPN)
+sudo ./setup-6to4-tunnel.sh --setup-vpn-client \
+  --local-ipv4-public 203.0.113.20 \
+  --remote-ipv4-public 203.0.113.10 \
+  --local-ipv6-tunnel fc00::2/64 \
+  --remote-ipv6-tunnel fc00::1 \
+  --local-ipv4-inner 10.0.0.2/30 \
+  --remote-ipv4-inner 10.0.0.1 \
+  --mtu 1400
+
+# Test VPN connection
+ping 10.0.0.1              # Test tunnel
+curl ifconfig.me           # Should show server's IP!
+```
+
+### Quick VPN Setup
+
+Use the interactive VPN setup script:
+
+```bash
+cd examples
+sudo ./vpn-setup.sh
+```
+
+📖 **See [VPN_USAGE.md](VPN_USAGE.md) for complete VPN documentation**  
+📋 **See [QUICK_VPN_SETUP.sh](QUICK_VPN_SETUP.sh) for copy-paste commands**
+
 ### Testing Connectivity
 
 Run comprehensive connectivity tests:
@@ -183,7 +235,7 @@ sudo ./setup-6to4-tunnel.sh --status
 
 ### Cleanup
 
-Remove all tunnel configurations:
+Remove all tunnel configurations (now properly removes everything!):
 
 ```bash
 sudo ./setup-6to4-tunnel.sh --cleanup
@@ -193,7 +245,10 @@ sudo ./setup-6to4-tunnel.sh --cleanup
 
 ### Modes
 
-- `--setup-6to4` - Setup 6to4 tunnel
+- `--setup-full` - Setup complete stack (6to4 + IPIPv6)
+- `--setup-vpn-server` - Setup VPN server with NAT (NEW!)
+- `--setup-vpn-client` - Setup VPN client with routing (NEW!)
+- `--setup-6to4` - Setup 6to4 tunnel only
 - `--setup-ipipv6` - Setup IPIPv6 tunnel over IPv6
 - `--test` - Test connectivity between servers
 - `--cleanup` - Remove tunnel configuration
@@ -214,6 +269,11 @@ sudo ./setup-6to4-tunnel.sh --cleanup
 - `--local-ipv6 <ip>` - Local IPv6 address (required)
 - `--remote-ipv6 <ip>` - Remote IPv6 address (peer)
 - `--ipipv6-interface <name>` - Name for IPIPv6 interface (default: ipip6)
+
+### VPN Options (NEW!)
+
+- `--nat-interface <iface>` - Interface for NAT on server (required for server mode)
+- `--vpn-subnet <subnet>` - Subnet to route through VPN (default: 0.0.0.0/0 = all traffic)
 
 ### Test Options
 
