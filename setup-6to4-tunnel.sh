@@ -452,22 +452,21 @@ setup_vpn_client() {
     # Get local IP address on the original interface
     LOCAL_IP=$(ip -4 addr show "$ORIGINAL_IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
     
-    # Add route to remote public IP via original gateway (to maintain tunnel connectivity)
+    # Detect and preserve local network
+    if [ -n "$LOCAL_IP" ]; then
+        print_info "Detecting local network configuration..."
+        LOCAL_NETWORK=$(ip route | grep "$ORIGINAL_IFACE" | grep -v default | grep "scope link" | head -1 | awk '{print $1}')
+        if [ -n "$LOCAL_NETWORK" ]; then
+            print_info "Local network: $LOCAL_NETWORK via $ORIGINAL_IFACE"
+        else
+            print_warning "Could not detect local network"
+        fi
+    fi
+    
+    # CRITICAL: Add route to remote public IP via original gateway BEFORE removing default
     print_info "Adding route to remote server via original gateway"
     ip route add "$REMOTE_IPV4_PUBLIC"/32 via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" 2>/dev/null || \
         print_warning "Route to $REMOTE_IPV4_PUBLIC already exists"
-    
-    # Preserve local network access
-    if [ -n "$LOCAL_IP" ]; then
-        print_info "Preserving local network access for incoming connections..."
-        LOCAL_NETWORK=$(ip route | grep "$ORIGINAL_IFACE" | grep -v default | head -1 | awk '{print $1}')
-        if [ -n "$LOCAL_NETWORK" ]; then
-            print_info "Local network: $LOCAL_NETWORK via $ORIGINAL_IFACE"
-            # Make sure local network route stays on original interface
-            ip route add "$LOCAL_NETWORK" dev "$ORIGINAL_IFACE" src "$LOCAL_IP" 2>/dev/null || \
-                print_warning "Local network route already exists"
-        fi
-    fi
     
     # Configure reverse path filtering to allow incoming connections
     print_info "Configuring reverse path filtering for incoming connections..."
@@ -479,14 +478,22 @@ setup_vpn_client() {
     if [ -z "$VPN_SUBNET" ] || [ "$VPN_SUBNET" = "0.0.0.0/0" ]; then
         print_info "Routing ALL outgoing traffic through VPN tunnel"
         
+        # Preserve local network route BEFORE deleting default
+        if [ -n "$LOCAL_NETWORK" ]; then
+            print_info "Ensuring local network route is preserved: $LOCAL_NETWORK"
+            # Re-add local network route with high priority (low metric)
+            ip route del "$LOCAL_NETWORK" dev "$ORIGINAL_IFACE" 2>/dev/null || true
+            ip route add "$LOCAL_NETWORK" dev "$ORIGINAL_IFACE" src "$LOCAL_IP" metric 50 2>/dev/null || true
+        fi
+        
         # Delete existing default route
         print_info "Removing original default route"
         ip route del default via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" 2>/dev/null || true
         
         # Add default route through VPN (split into two /1 routes to override default)
         print_info "Adding new default route through VPN"
-        ip route add 0.0.0.0/1 via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" 2>/dev/null || true
-        ip route add 128.0.0.0/1 via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" 2>/dev/null || true
+        ip route add 0.0.0.0/1 via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" metric 100 2>/dev/null || true
+        ip route add 128.0.0.0/1 via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" metric 100 2>/dev/null || true
         
         # Add policy routing for incoming connections on original interface
         if [ -n "$LOCAL_IP" ]; then
