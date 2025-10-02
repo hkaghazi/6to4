@@ -123,8 +123,14 @@ iptables -A FORWARD -i eth0 -o ipip6 -m state --state RELATED,ESTABLISHED -j ACC
 2. Creates IPIPv6 tunnel (IPv4 over IPv6)
 3. Saves original default gateway
 4. Adds route to VPN server via original gateway (keeps tunnel alive)
-5. Replaces default route to send all traffic through VPN tunnel
-6. Optionally updates DNS to public DNS servers
+5. **Configures policy-based routing for incoming connections** (NEW!)
+   - Preserves SSH and incoming connection handling
+   - Uses custom routing table for replies to incoming connections
+   - Sets up loose reverse path filtering
+6. Replaces default route to send all outgoing traffic through VPN tunnel
+7. Optionally updates DNS to public DNS servers
+
+> **Important**: Incoming connections (like SSH) to the client machine work normally! The script uses policy-based routing to ensure replies to incoming connections use the original interface, while outgoing traffic goes through the VPN.
 
 **Routing Changes:**
 
@@ -173,7 +179,73 @@ Or list all interfaces:
 ip link show
 ```
 
+## Incoming Connections (SSH, HTTP, etc.)
+
+### ✅ Incoming Connections Work!
+
+The VPN client is configured to handle incoming connections properly using **policy-based routing**:
+
+- **SSH to the client** works normally
+- **Web services on the client** are accessible
+- **Any incoming connection** is handled correctly
+- **Only outgoing traffic** goes through the VPN
+
+### How It Works
+
+```
+Incoming SSH:
+  Remote → eth0 (arrives) → [Policy routing] → eth0 (replies) → Remote
+  ✓ SSH Connection works!
+
+Outgoing Traffic:
+  Client → [VPN route] → Tunnel → VPN Server → Internet
+  ✓ Internet via VPN works!
+```
+
+### Testing Incoming Connections
+
+```bash
+# From another machine on your network:
+ssh user@CLIENT_IP
+# This should work even when VPN is connected! ✓
+
+# From the client, verify VPN is working:
+curl ifconfig.me
+# Should show VPN server's IP ✓
+```
+
+### Technical Details
+
+The script automatically configures:
+
+1. **Policy routing table (table 100)** - For replies to incoming connections
+2. **IP rules** - Routes replies from local IP via original interface
+3. **Reverse path filtering (loose mode)** - Allows asymmetric routing
+4. **Local network preservation** - Keeps LAN access working
+
+For complete technical explanation, see: **INCOMING_CONNECTIONS_FIX.md**
+
 ## Troubleshooting
+
+### SSH to Client Not Working
+
+If SSH to the client still doesn't work after VPN is connected:
+
+```bash
+# Check policy routing rules exist:
+ip rule show
+# Should show priority 100 and 101
+
+# Check custom routing table:
+ip route show table 100
+# Should show default route via original gateway
+
+# Check reverse path filtering:
+sysctl net.ipv4.conf.all.rp_filter
+# Should return: 2 (loose mode)
+```
+
+If these are not set, reconnect the VPN client to apply the fix.
 
 ### VPN Tunnel Connects but No Internet
 

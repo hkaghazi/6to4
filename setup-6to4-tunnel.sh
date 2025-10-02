@@ -444,14 +444,35 @@ setup_vpn_client() {
     
     print_info "Original gateway: $ORIGINAL_GW via $ORIGINAL_IFACE"
     
+    # Get local IP address on the original interface
+    LOCAL_IP=$(ip -4 addr show "$ORIGINAL_IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    
     # Add route to remote public IP via original gateway (to maintain tunnel connectivity)
     print_info "Adding route to remote server via original gateway"
     ip route add "$REMOTE_IPV4_PUBLIC"/32 via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" 2>/dev/null || \
         print_warning "Route to $REMOTE_IPV4_PUBLIC already exists"
     
+    # Preserve local network access
+    if [ -n "$LOCAL_IP" ]; then
+        print_info "Preserving local network access for incoming connections..."
+        LOCAL_NETWORK=$(ip route | grep "$ORIGINAL_IFACE" | grep -v default | head -1 | awk '{print $1}')
+        if [ -n "$LOCAL_NETWORK" ]; then
+            print_info "Local network: $LOCAL_NETWORK via $ORIGINAL_IFACE"
+            # Make sure local network route stays on original interface
+            ip route add "$LOCAL_NETWORK" dev "$ORIGINAL_IFACE" src "$LOCAL_IP" 2>/dev/null || \
+                print_warning "Local network route already exists"
+        fi
+    fi
+    
+    # Configure reverse path filtering to allow incoming connections
+    print_info "Configuring reverse path filtering for incoming connections..."
+    sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf."$ORIGINAL_IFACE".rp_filter=2 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf."$IPIPV6_INTERFACE".rp_filter=2 >/dev/null 2>&1 || true
+    
     # Determine what to route through VPN
     if [ -z "$VPN_SUBNET" ] || [ "$VPN_SUBNET" = "0.0.0.0/0" ]; then
-        print_info "Routing ALL traffic through VPN tunnel"
+        print_info "Routing ALL outgoing traffic through VPN tunnel"
         
         # Delete existing default route
         print_info "Removing original default route"
@@ -461,6 +482,28 @@ setup_vpn_client() {
         print_info "Adding new default route through VPN"
         ip route add 0.0.0.0/1 via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" 2>/dev/null || true
         ip route add 128.0.0.0/1 via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" 2>/dev/null || true
+        
+        # Add policy routing for incoming connections on original interface
+        if [ -n "$LOCAL_IP" ]; then
+            print_info "Setting up policy routing for incoming SSH/connections..."
+            
+            # Create custom routing table for local interface (table 100)
+            ip route add default via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" table 100 2>/dev/null || true
+            if [ -n "$LOCAL_NETWORK" ]; then
+                ip route add "$LOCAL_NETWORK" dev "$ORIGINAL_IFACE" src "$LOCAL_IP" table 100 2>/dev/null || true
+            fi
+            
+            # Add rule: packets from local IP use table 100 (original interface)
+            ip rule add from "$LOCAL_IP" table 100 priority 100 2>/dev/null || \
+                print_warning "Policy routing rule already exists"
+            
+            # Add rule: packets to local network use table 100
+            if [ -n "$LOCAL_NETWORK" ]; then
+                ip rule add to "$LOCAL_NETWORK" table 100 priority 101 2>/dev/null || true
+            fi
+            
+            print_success "Incoming connections will be handled via $ORIGINAL_IFACE"
+        fi
     else
         print_info "Routing specific subnet through VPN: $VPN_SUBNET"
         ip route add "$VPN_SUBNET" via "${REMOTE_IPV4_INNER%%/*}" dev "$IPIPV6_INTERFACE" 2>/dev/null || \
@@ -489,8 +532,12 @@ DNSEOF
     echo "  Inner IPv4: $LOCAL_IPV4_INNER"
     echo "  Remote Gateway: ${REMOTE_IPV4_INNER%%/*}"
     echo "  Original Gateway: $ORIGINAL_GW (preserved for tunnel traffic)"
+    if [ -n "$LOCAL_IP" ]; then
+        echo "  Local IP: $LOCAL_IP (preserved for incoming connections)"
+    fi
     if [ -z "$VPN_SUBNET" ] || [ "$VPN_SUBNET" = "0.0.0.0/0" ]; then
-        echo "  Routing: ALL traffic through VPN"
+        echo "  Routing: ALL outgoing traffic through VPN"
+        echo "  Incoming: SSH and connections to $LOCAL_IP work normally"
     else
         echo "  Routing: $VPN_SUBNET through VPN"
     fi
@@ -498,6 +545,9 @@ DNSEOF
     echo -e "${YELLOW}Test VPN connectivity:${NC}"
     echo "  curl ifconfig.me  # Should show VPN server's public IP"
     echo "  ping 8.8.8.8      # Test internet connectivity"
+    if [ -n "$LOCAL_IP" ]; then
+        echo "  ssh user@$LOCAL_IP  # SSH to this client should work"
+    fi
     echo ""
     echo -e "${YELLOW}To restore original routing:${NC}"
     echo "  $0 --cleanup"
@@ -714,6 +764,19 @@ cleanup_tunnels() {
         mv /etc/resolv.conf.backup /etc/resolv.conf
         print_success "DNS configuration restored"
     fi
+    
+    # Remove policy routing rules
+    print_info "Removing policy routing rules..."
+    ip rule del priority 100 2>/dev/null || true
+    ip rule del priority 101 2>/dev/null || true
+    
+    # Remove custom routing table entries
+    print_info "Removing custom routing tables..."
+    ip route flush table 100 2>/dev/null || true
+    
+    # Restore default reverse path filtering
+    print_info "Restoring reverse path filtering..."
+    sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1 || true
     
     # Remove VPN routes first
     print_info "Removing VPN routes..."
