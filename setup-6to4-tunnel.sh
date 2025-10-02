@@ -40,6 +40,8 @@ TEST_MODE=false
 CLEANUP=false
 VPN_SUBNET=""           # VPN subnet for client devices (e.g., 10.8.0.0/24)
 NAT_INTERFACE=""        # Interface for NAT/masquerading (server mode)
+WHITELIST_FILE="/etc/6to4/whitelist.txt"  # File containing whitelist IPs/ranges
+WHITELIST_ACTION=""      # Action: add, import, remove, clear, list
 
 ################################################################################
 # Helper Functions
@@ -77,6 +79,12 @@ MODES:
     --test                  Test connectivity between servers
     --cleanup               Remove tunnel configuration
     --status                Show tunnel status
+    --whitelist-add <ip>    Add IP/CIDR to whitelist (bypass VPN)
+    --whitelist-import <file> Import IPs from file (one IP/CIDR per line)
+    --whitelist-remove <ip> Remove IP/CIDR from whitelist
+    --whitelist-clear       Clear all whitelist entries
+    --whitelist-list        List all whitelisted IPs
+    --whitelist-file <path> Custom whitelist file path (default: /etc/6to4/whitelist.txt)
 
 FULL STACK OPTIONS (--setup-full):
     --local-ipv4-public <ip>    Local public IPv4 for 6to4 endpoint (required)
@@ -105,6 +113,14 @@ IPIPV6 TUNNEL OPTIONS (--setup-ipipv6):
 VPN OPTIONS:
     --vpn-subnet <subnet>       VPN subnet for client traffic (e.g., 10.8.0.0/24)
     --nat-interface <iface>     Network interface for NAT (server mode, e.g., eth0)
+
+WHITELIST OPTIONS:
+    --whitelist-add <ip>        Add single IP or CIDR range to whitelist
+    --whitelist-import <file>   Import IPs from file (supports 3000+ entries)
+    --whitelist-remove <ip>     Remove IP or CIDR from whitelist
+    --whitelist-clear           Remove all whitelist entries
+    --whitelist-list            Display all whitelisted IPs
+    --whitelist-file <path>     Custom path for whitelist file
     
 VPN SERVER MODE (--setup-vpn-server):
     Sets up full tunnel stack + NAT/masquerading for client traffic
@@ -123,6 +139,21 @@ TEST OPTIONS:
     --traceroute                Run traceroute tests
 
 EXAMPLES:
+    # Add single IP to whitelist
+    $0 --whitelist-add 192.168.1.100
+
+    # Add CIDR range to whitelist
+    $0 --whitelist-add 10.20.0.0/16
+
+    # Import large list of IPs from file
+    $0 --whitelist-import /path/to/whitelist.txt
+
+    # Remove IP from whitelist
+    $0 --whitelist-remove 192.168.1.100
+
+    # List all whitelisted IPs
+    $0 --whitelist-list
+
     # VPN Server setup (masquerades all client traffic)
     $0 --setup-vpn-server \\
        --local-ipv4-public 203.0.113.10 \\
@@ -347,6 +378,259 @@ setup_ipipv6_tunnel() {
 }
 
 ################################################################################
+# Whitelist Functions
+################################################################################
+
+ensure_whitelist_file() {
+    local dir=$(dirname "$WHITELIST_FILE")
+    if [ ! -d "$dir" ]; then
+        mkdir -p "$dir"
+        print_info "Created whitelist directory: $dir"
+    fi
+    if [ ! -f "$WHITELIST_FILE" ]; then
+        touch "$WHITELIST_FILE"
+        print_info "Created whitelist file: $WHITELIST_FILE"
+    fi
+}
+
+validate_ip_or_cidr() {
+    local ip="$1"
+    # Check if it's a valid IP or CIDR notation
+    if echo "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+whitelist_add() {
+    local ip="$1"
+    
+    if [ -z "$ip" ]; then
+        print_error "No IP address specified"
+        exit 1
+    fi
+    
+    if ! validate_ip_or_cidr "$ip"; then
+        print_error "Invalid IP address or CIDR: $ip"
+        print_info "Examples: 192.168.1.1 or 10.0.0.0/24"
+        exit 1
+    fi
+    
+    ensure_whitelist_file
+    
+    # Check if already exists
+    if grep -qxF "$ip" "$WHITELIST_FILE" 2>/dev/null; then
+        print_warning "IP already in whitelist: $ip"
+        return 0
+    fi
+    
+    echo "$ip" >> "$WHITELIST_FILE"
+    print_success "Added to whitelist: $ip"
+    
+    # Apply routing if VPN client is active
+    if ip route show table 100 >/dev/null 2>&1 && ip link show "$IPIPV6_INTERFACE" >/dev/null 2>&1; then
+        apply_whitelist_routing
+    fi
+}
+
+whitelist_import() {
+    local import_file="$1"
+    
+    if [ -z "$import_file" ]; then
+        print_error "No import file specified"
+        exit 1
+    fi
+    
+    if [ ! -f "$import_file" ]; then
+        print_error "Import file not found: $import_file"
+        exit 1
+    fi
+    
+    ensure_whitelist_file
+    
+    print_info "Importing IPs from: $import_file"
+    
+    local count=0
+    local invalid=0
+    local duplicates=0
+    
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Skip empty lines and comments
+        line=$(echo "$line" | sed 's/#.*//;s/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$line" ] && continue
+        
+        if ! validate_ip_or_cidr "$line"; then
+            print_warning "Skipping invalid entry: $line"
+            ((invalid++))
+            continue
+        fi
+        
+        if grep -qxF "$line" "$WHITELIST_FILE" 2>/dev/null; then
+            ((duplicates++))
+            continue
+        fi
+        
+        echo "$line" >> "$WHITELIST_FILE"
+        ((count++))
+        
+        # Progress indicator for large files
+        if [ $((count % 500)) -eq 0 ]; then
+            print_info "Imported $count entries..."
+        fi
+    done < "$import_file"
+    
+    print_success "Import complete!"
+    echo "  Added: $count"
+    [ $duplicates -gt 0 ] && echo "  Duplicates skipped: $duplicates"
+    [ $invalid -gt 0 ] && echo "  Invalid entries skipped: $invalid"
+    
+    # Apply routing if VPN client is active
+    if ip route show table 100 >/dev/null 2>&1 && ip link show "$IPIPV6_INTERFACE" >/dev/null 2>&1; then
+        apply_whitelist_routing
+    fi
+}
+
+whitelist_remove() {
+    local ip="$1"
+    
+    if [ -z "$ip" ]; then
+        print_error "No IP address specified"
+        exit 1
+    fi
+    
+    if [ ! -f "$WHITELIST_FILE" ]; then
+        print_warning "Whitelist file does not exist"
+        return 0
+    fi
+    
+    if ! grep -qxF "$ip" "$WHITELIST_FILE"; then
+        print_warning "IP not found in whitelist: $ip"
+        return 0
+    fi
+    
+    # Remove from file
+    local temp_file="${WHITELIST_FILE}.tmp"
+    grep -vxF "$ip" "$WHITELIST_FILE" > "$temp_file"
+    mv "$temp_file" "$WHITELIST_FILE"
+    
+    print_success "Removed from whitelist: $ip"
+    
+    # Remove routing if VPN client is active
+    if ip route show table 100 >/dev/null 2>&1; then
+        remove_whitelist_route "$ip"
+    fi
+}
+
+whitelist_clear() {
+    if [ ! -f "$WHITELIST_FILE" ]; then
+        print_warning "Whitelist file does not exist"
+        return 0
+    fi
+    
+    local count=$(wc -l < "$WHITELIST_FILE" 2>/dev/null || echo 0)
+    
+    if [ "$count" -eq 0 ]; then
+        print_info "Whitelist is already empty"
+        return 0
+    fi
+    
+    print_warning "This will remove all $count whitelisted IPs"
+    read -p "Are you sure? (yes/no): " -r
+    if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+        print_info "Operation cancelled"
+        return 0
+    fi
+    
+    # Remove all routing rules
+    if ip route show table 100 >/dev/null 2>&1; then
+        clear_whitelist_routing
+    fi
+    
+    > "$WHITELIST_FILE"
+    print_success "Whitelist cleared ($count entries removed)"
+}
+
+whitelist_list() {
+    if [ ! -f "$WHITELIST_FILE" ]; then
+        print_info "Whitelist file does not exist"
+        return 0
+    fi
+    
+    local count=$(wc -l < "$WHITELIST_FILE" 2>/dev/null || echo 0)
+    
+    if [ "$count" -eq 0 ]; then
+        print_info "Whitelist is empty"
+        return 0
+    fi
+    
+    echo -e "${BLUE}=== Whitelisted IPs ($count entries) ===${NC}"
+    echo ""
+    cat "$WHITELIST_FILE"
+    echo ""
+    print_info "These IPs bypass VPN routing"
+}
+
+apply_whitelist_routing() {
+    if [ ! -f "$WHITELIST_FILE" ]; then
+        return 0
+    fi
+    
+    print_info "Applying whitelist routing rules..."
+    
+    local count=0
+    while IFS= read -r ip || [ -n "$ip" ]; do
+        [ -z "$ip" ] && continue
+        
+        # Add route via original gateway (table 100)
+        if [ -n "$ORIGINAL_GW" ] && [ -n "$ORIGINAL_IFACE" ]; then
+            ip route add "$ip" via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" table 100 2>/dev/null || true
+        fi
+        
+        # Also add to main routing table with higher priority
+        if [ -n "$ORIGINAL_GW" ] && [ -n "$ORIGINAL_IFACE" ]; then
+            ip route add "$ip" via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" metric 50 2>/dev/null || true
+        fi
+        
+        ((count++))
+        
+        # Progress indicator for large lists
+        if [ $((count % 500)) -eq 0 ]; then
+            print_info "Applied $count routing rules..."
+        fi
+    done < "$WHITELIST_FILE"
+    
+    print_success "Applied $count whitelist routing rules"
+}
+
+remove_whitelist_route() {
+    local ip="$1"
+    
+    # Remove from both routing tables
+    ip route del "$ip" table 100 2>/dev/null || true
+    ip route del "$ip" 2>/dev/null || true
+    
+    print_info "Removed routing rule for: $ip"
+}
+
+clear_whitelist_routing() {
+    if [ ! -f "$WHITELIST_FILE" ]; then
+        return 0
+    fi
+    
+    print_info "Removing all whitelist routing rules..."
+    
+    local count=0
+    while IFS= read -r ip || [ -n "$ip" ]; do
+        [ -z "$ip" ] && continue
+        remove_whitelist_route "$ip"
+        ((count++))
+    done < "$WHITELIST_FILE"
+    
+    print_info "Removed $count whitelist routing rules"
+}
+
+################################################################################
 # VPN Functions
 ################################################################################
 
@@ -522,6 +806,17 @@ setup_vpn_client() {
             print_warning "Route for $VPN_SUBNET already exists"
     fi
     
+    # Apply whitelist routing rules
+    if [ -f "$WHITELIST_FILE" ]; then
+        local whitelist_count=$(wc -l < "$WHITELIST_FILE" 2>/dev/null || echo 0)
+        if [ "$whitelist_count" -gt 0 ]; then
+            echo ""
+            print_info "Applying whitelist routing ($whitelist_count entries)..."
+            apply_whitelist_routing
+            echo ""
+        fi
+    fi
+    
     # Configure DNS (optional - point to common DNS servers)
     print_info "Configuring DNS for VPN..."
     if [ -f /etc/resolv.conf.backup ]; then
@@ -553,6 +848,15 @@ DNSEOF
     else
         echo "  Routing: $VPN_SUBNET through VPN"
     fi
+    
+    # Show whitelist status
+    if [ -f "$WHITELIST_FILE" ]; then
+        local whitelist_count=$(wc -l < "$WHITELIST_FILE" 2>/dev/null || echo 0)
+        if [ "$whitelist_count" -gt 0 ]; then
+            echo "  Whitelist: $whitelist_count IPs bypass VPN"
+        fi
+    fi
+    
     echo ""
     echo -e "${YELLOW}Test VPN connectivity:${NC}"
     echo "  curl ifconfig.me  # Should show VPN server's public IP"
@@ -828,6 +1132,11 @@ cleanup_tunnels() {
     print_info "Restoring reverse path filtering..."
     sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1 || true
     
+    # Clear whitelist routing
+    if [ -f "$WHITELIST_FILE" ]; then
+        clear_whitelist_routing
+    fi
+    
     # Remove VPN routes
     print_info "Removing VPN routes..."
     ip route del 0.0.0.0/1 2>/dev/null || true
@@ -1045,6 +1354,31 @@ while [ $# -gt 0 ]; do
         --ping-test)
             PING_TEST=true
             ;;
+        --whitelist-add)
+            MODE="whitelist-add"
+            WHITELIST_IP="$2"
+            shift
+            ;;
+        --whitelist-import)
+            MODE="whitelist-import"
+            WHITELIST_IMPORT_FILE="$2"
+            shift
+            ;;
+        --whitelist-remove)
+            MODE="whitelist-remove"
+            WHITELIST_IP="$2"
+            shift
+            ;;
+        --whitelist-clear)
+            MODE="whitelist-clear"
+            ;;
+        --whitelist-list)
+            MODE="whitelist-list"
+            ;;
+        --whitelist-file)
+            WHITELIST_FILE="$2"
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -1089,6 +1423,25 @@ case "$MODE" in
     cleanup)
         check_root
         cleanup_tunnels
+        ;;
+    whitelist-add)
+        check_root
+        whitelist_add "$WHITELIST_IP"
+        ;;
+    whitelist-import)
+        check_root
+        whitelist_import "$WHITELIST_IMPORT_FILE"
+        ;;
+    whitelist-remove)
+        check_root
+        whitelist_remove "$WHITELIST_IP"
+        ;;
+    whitelist-clear)
+        check_root
+        whitelist_clear
+        ;;
+    whitelist-list)
+        whitelist_list
         ;;
     *)
         print_error "No valid mode specified"

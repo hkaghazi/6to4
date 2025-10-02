@@ -1,0 +1,29 @@
+# Whitelist Example File
+# IPs and ranges listed here will bypass VPN routing
+# Format: One IP or CIDR range per line
+# Lines starting with # are comments and will be ignored
+
+# Single IP addresses
+192.168.1.100
+192.168.1.101
+10.20.30.40
+
+# CIDR ranges
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+
+# External services (examples)
+8.8.8.8
+8.8.4.4
+1.1.1.1
+
+# Company networks (examples)
+203.0.113.0/24
+198.51.100.0/24
+
+# AWS IP ranges (example)
+52.94.0.0/20
+54.231.0.0/17
+
+# Add your IP ranges below:
