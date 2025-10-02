@@ -444,6 +444,11 @@ setup_vpn_client() {
     
     print_info "Original gateway: $ORIGINAL_GW via $ORIGINAL_IFACE"
     
+    # Save original gateway information for cleanup
+    print_info "Saving original gateway information..."
+    echo "$ORIGINAL_GW" > /tmp/.6to4_original_gw 2>/dev/null || true
+    echo "$ORIGINAL_IFACE" > /tmp/.6to4_original_iface 2>/dev/null || true
+    
     # Get local IP address on the original interface
     LOCAL_IP=$(ip -4 addr show "$ORIGINAL_IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
     
@@ -758,6 +763,44 @@ cleanup_tunnels() {
     print_info "Cleaning up tunnel configurations..."
     echo ""
     
+    # Detect current network configuration before cleanup
+    print_info "Detecting network configuration..."
+    CURRENT_DEFAULT_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    CURRENT_DEFAULT_GW=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+    
+    # Try to load saved gateway information
+    SAVED_GW=""
+    SAVED_IFACE=""
+    if [ -f /tmp/.6to4_original_gw ]; then
+        SAVED_GW=$(cat /tmp/.6to4_original_gw 2>/dev/null)
+    fi
+    if [ -f /tmp/.6to4_original_iface ]; then
+        SAVED_IFACE=$(cat /tmp/.6to4_original_iface 2>/dev/null)
+    fi
+    
+    # Determine which gateway to use
+    if [ -n "$CURRENT_DEFAULT_GW" ]; then
+        ORIGINAL_GW="$CURRENT_DEFAULT_GW"
+        ORIGINAL_IFACE="$CURRENT_DEFAULT_IFACE"
+        print_info "Current default gateway: $ORIGINAL_GW via $ORIGINAL_IFACE"
+    elif [ -n "$SAVED_GW" ] && [ -n "$SAVED_IFACE" ]; then
+        ORIGINAL_GW="$SAVED_GW"
+        ORIGINAL_IFACE="$SAVED_IFACE"
+        print_info "Using saved gateway: $ORIGINAL_GW via $ORIGINAL_IFACE"
+    else
+        # Try to find from routing table 100
+        ORIGINAL_GW=$(ip route show table 100 2>/dev/null | grep default | awk '{print $3}')
+        ORIGINAL_IFACE=$(ip route show table 100 2>/dev/null | grep default | awk '{print $5}')
+        
+        if [ -z "$ORIGINAL_GW" ]; then
+            # Look for a specific route (to VPN server) that preserves the original gateway
+            ORIGINAL_GW=$(ip route show | grep -v "0.0.0.0/1\|128.0.0.0/1\|default" | grep "via" | head -1 | awk '{print $3}')
+            ORIGINAL_IFACE=$(ip route show | grep -v "0.0.0.0/1\|128.0.0.0/1\|default" | grep "via" | head -1 | awk '{print $5}')
+        fi
+        
+        print_info "Detected gateway: ${ORIGINAL_GW:-not found} via ${ORIGINAL_IFACE:-not found}"
+    fi
+    
     # Restore DNS if backup exists
     if [ -f /etc/resolv.conf.backup ]; then
         print_info "Restoring original DNS configuration..."
@@ -778,7 +821,7 @@ cleanup_tunnels() {
     print_info "Restoring reverse path filtering..."
     sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1 || true
     
-    # Remove VPN routes first
+    # Remove VPN routes
     print_info "Removing VPN routes..."
     ip route del 0.0.0.0/1 2>/dev/null || true
     ip route del 128.0.0.0/1 2>/dev/null || true
@@ -851,10 +894,52 @@ cleanup_tunnels() {
         netfilter-persistent save 2>/dev/null || true
     fi
     
+    # Restore default route if we have the information
+    print_info "Restoring default route..."
+    if [ -n "$ORIGINAL_GW" ] && [ -n "$ORIGINAL_IFACE" ]; then
+        # Check if default route already exists
+        if ! ip route show default | grep -q "default"; then
+            print_info "Adding default route: via $ORIGINAL_GW dev $ORIGINAL_IFACE"
+            ip route add default via "$ORIGINAL_GW" dev "$ORIGINAL_IFACE" 2>/dev/null || \
+                print_warning "Could not restore default route automatically"
+        else
+            print_info "Default route already exists"
+        fi
+    else
+        print_warning "Could not detect original gateway information"
+        print_warning "You may need to manually restore your default route:"
+        print_warning "  ip route add default via <gateway-ip> dev <interface>"
+        print_warning "Or restart networking:"
+        print_warning "  systemctl restart networking"
+        print_warning "  OR: systemctl restart NetworkManager"
+    fi
+    
+    # Verify network connectivity
+    echo ""
+    print_info "Verifying network connectivity..."
+    if ip route show default | grep -q "default"; then
+        DEFAULT_ROUTE=$(ip route show default)
+        print_success "Default route exists: $DEFAULT_ROUTE"
+        
+        # Test connectivity
+        if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+            print_success "Internet connectivity: Working ✓"
+        else
+            print_warning "Internet connectivity: Not working"
+            print_info "Try: ping $(ip route show default | awk '{print $3}')"
+        fi
+    else
+        print_error "No default route found!"
+        print_info "Restore manually with:"
+        print_info "  ip route add default via <gateway-ip> dev <interface>"
+    fi
+    
+    # Clean up temporary files
+    rm -f /tmp/.6to4_original_gw /tmp/.6to4_original_iface 2>/dev/null || true
+    
     echo ""
     print_success "Cleanup complete!"
     print_info "All tunnel interfaces and routes have been removed"
-    print_info "Original network configuration should be restored"
     echo ""
 }
 
